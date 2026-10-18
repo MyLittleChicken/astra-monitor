@@ -31,10 +31,12 @@ import CancellableTaskManager from '../utils/cancellableTaskManager.js';
 import { EDID, EdidParser } from '../utils/edidParser.js';
 import {
     INTEL_SAMPLE_FLUSH,
+    IntelFdinfo,
     IntelInfoRaw,
     intelActivity,
     intelActivityFromRates,
     intelActivityFromRc6,
+    intelFdinfoSample,
     intelFrequency,
     intelMaxRates,
     intelPower,
@@ -376,6 +378,17 @@ export type DisplayData = {
     edid: EDID | null;
 };
 
+/**
+ * The memory regions of an Intel GPU under the names the menu shows: 'system' is what
+ * intel_gpu_top reports on an integrated GPU, 'gtt' what xe reports for the same memory
+ * once it is bound for the GPU, and 'stolen' the range reserved for it at boot.
+ */
+const INTEL_VRAM_REGIONS: { [region: string]: string } = {
+    system: 'System Memory',
+    gtt: 'System Memory',
+    stolen: 'Stolen Memory',
+};
+
 type IntelDevice = {
     gpu: GpuInfo;
     card: string;
@@ -388,6 +401,30 @@ type IntelDevice = {
 };
 
 export default class GpuMonitor extends Monitor {
+    static get TOP_PROCESSES_LIMIT() {
+        return 10;
+    }
+
+    /**
+     * Descriptors read in one fdinfo scan. A process can open the render node as many
+     * times as its file limit allows, and reading all of them would cost the shell's
+     * main loop without telling the user anything a few hundred do not.
+     */
+    private static get INTEL_FDINFO_LIMIT() {
+        return 512;
+    }
+
+    /**
+     * Processes whose descriptors are listed before the main loop is given back. The
+     * loop over the entries of a directory runs in the calling thread, so all of them
+     * dispatched at once hold it for as long as the whole walk takes: measured on a
+     * machine with 694 processes, in slices of 8 the longest stretch it is held for is
+     * 22ms rather than 94ms, for the same 135ms of work.
+     */
+    private static get INTEL_FDINFO_SLICE() {
+        return 8;
+    }
+
     private status = false;
     private updateAmdGpuTask: ContinuousTaskManager;
     private updateNvidiaGpuTask: ContinuousTaskManager;
@@ -411,6 +448,7 @@ export default class GpuMonitor extends Monitor {
             maxRates?: { [gt: string]: number };
         }
     > = new Map();
+    private intelFdinfo: Map<string, Map<string, IntelFdinfo>> = new Map();
     private intelWarned: Set<string> = new Set();
     private intelRaplPath?: string | null;
     private intelCpuTempPath?: string | null;
@@ -508,6 +546,7 @@ export default class GpuMonitor extends Monitor {
         this.infoPipesCaches.clear();
         this.intelSamples.clear();
         this.intelPrevious.clear();
+        this.intelFdinfo.clear();
         this.intelWarned.clear();
     }
 
@@ -633,6 +672,7 @@ export default class GpuMonitor extends Monitor {
         this.intelGpus.clear();
         this.intelSamples.clear();
         this.intelPrevious.clear();
+        this.intelFdinfo.clear();
         this.intelWarned.clear();
     }
 
@@ -2401,6 +2441,70 @@ export default class GpuMonitor extends Monitor {
         }
     }
 
+    /**
+     * The fdinfo of the descriptors open on /dev/dri, the files intel_gpu_top and gputop
+     * build their own client tables from. Only the processes of the user are readable;
+     * those and the ones gone meanwhile are skipped, as the processor monitor does.
+     */
+    private async scanIntelFdinfo(): Promise<Map<string, IntelFdinfo>> {
+        const descriptors = new Map<string, IntelFdinfo>();
+        // Names only: the pids are told apart by their name, and asking for the type
+        // would cost a stat() of every one of the thousands of entries of /proc.
+        // Sorted, so that a machine over the budget below keeps the same processes from
+        // one scan to the next and their deltas survive.
+        const pids = (await Utils.readDirAsync('/proc'))
+            .filter(name => /^\d+$/.test(name))
+            .sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+
+        // The descriptors are spent from a budget before they are read, not counted as
+        // the reads come back: every one of these tasks starts before the first read
+        // resolves, so a size check would see an empty map in all of them.
+        let budget = GpuMonitor.INTEL_FDINFO_LIMIT;
+
+        const readProcess = async (pid: string) => {
+            try {
+                // The targets are read as the strings they are, so that filtering
+                // them does not stat every open file of every process
+                const fds = (
+                    await Utils.listDirAsync(`/proc/${pid}/fd`, {
+                        folders: true,
+                        files: true,
+                        symlinks: true,
+                    })
+                ).filter(fd => fd.target?.startsWith('/dev/dri/'));
+                if(fds.length === 0 || budget <= 0) return;
+
+                const taken = fds.slice(0, budget);
+                budget -= taken.length;
+
+                const name = (await Utils.readFileAsync(`/proc/${pid}/comm`, true)).trim();
+                await Promise.all(
+                    taken.map(async fd =>
+                        descriptors.set(`${pid}/${fd.name}`, {
+                            pid: parseInt(pid, 10),
+                            name,
+                            content: await Utils.readFileAsync(
+                                `/proc/${pid}/fdinfo/${fd.name}`,
+                                true
+                            ),
+                        })
+                    )
+                );
+            } catch(_e) {
+                // Avoid logging errors for gone processes
+            }
+        };
+
+        // In slices, so the shell gets to draw a frame between them: the loop over the
+        // entries of a directory runs in the calling thread, and all of them dispatched
+        // at once hold it for as long as the whole walk takes
+        for(let i = 0; i < pids.length; i += GpuMonitor.INTEL_FDINFO_SLICE) {
+            // eslint-disable-next-line no-await-in-loop
+            await Promise.all(pids.slice(i, i + GpuMonitor.INTEL_FDINFO_SLICE).map(readProcess));
+        }
+        return descriptors;
+    }
+
     private updateIntelGpuSample(uuid: string, data: ContinuousTaskManagerData) {
         if(data.exit) {
             // Do not keep feeding a dead process' last sample to the UI
@@ -2500,11 +2604,44 @@ export default class GpuMonitor extends Monitor {
         const gpus = new Map<string, GenericGpuInfo>();
         const generation = this.gpuTaskGeneration;
 
+        //Fdinfo: intel_gpu_top refuses an xe GPU, so the sample it would have given is
+        //built from the DRM clients, the files it reads them from itself. That is a walk
+        //of the descriptors of every process, so it is read only while the GPU menu
+        //shows the table it feeds, and once for every GPU rather than once per GPU.
+        const clientsWanted = this.isListeningFor('gpuUpdateClients');
+        const wantsFdinfo = Array.from(this.intelGpus.entries()).some(
+            ([uuid, device]) => device.gts.length > 0 && !this.intelSamples.has(uuid)
+        );
+        let descriptors: Map<string, IntelFdinfo> | undefined;
+        if(clientsWanted && wantsFdinfo) {
+            descriptors = await this.scanIntelFdinfo();
+            if(this.isGpuTaskStale(generation)) return false;
+        }
+
         await Promise.all(
             Array.from(this.intelGpus.entries()).map(async ([uuid, device]) => {
-                const sample = this.intelSamples.get(uuid);
+                let sample = this.intelSamples.get(uuid);
+                let fromFdinfo = false;
                 const cardPath = device.cardPath;
                 const xe = device.gts.length > 0;
+
+                if(!sample && xe && descriptors) {
+                    const last = this.intelFdinfo.get(uuid);
+                    this.intelFdinfo.set(uuid, descriptors);
+                    // The resident memory of a client needs no previous scan, so the
+                    // first one already has something to report
+                    sample = intelFdinfoSample(last ?? new Map(), descriptors, uuid);
+                    fromFdinfo = true;
+
+                    if(descriptors.size > 0 && Object.keys(sample.clients ?? {}).length === 0)
+                        this.warnIntelOnce(
+                            `${uuid}:clients`,
+                            `Matched none of the ${descriptors.size} DRM descriptors to ` +
+                                `the Intel GPU ${uuid}`
+                        );
+                } else if(!clientsWanted) {
+                    this.intelFdinfo.delete(uuid);
+                }
 
                 // The CPU package is shared by the integrated GPU only
                 const energyPath = device.integrated ? raplPath : null;
@@ -2612,7 +2749,7 @@ export default class GpuMonitor extends Monitor {
                 const residency = xe
                     ? intelActivityFromRates(rates, previous?.maxRates)
                     : intelActivityFromRc6(previous?.rc6, rc6Value, elapsed);
-                const activity = intelActivity(sample, residency);
+                const activity = intelActivity(sample, residency, fromFdinfo);
                 gpu.activity.pipes = activity.pipes;
                 // A reading that is not a number would reach the header as 'NaN%'
                 if(activity.GFX != null && !isNaN(activity.GFX)) gpu.activity.GFX = activity.GFX;
@@ -2628,7 +2765,7 @@ export default class GpuMonitor extends Monitor {
                         gpu.vram.percent = (vram.used / memoryTotal) * 100;
                         for(const region of vram.regions)
                             gpu.vram.pipes.push({
-                                name: region.name === 'system' ? 'System Memory' : region.name,
+                                name: INTEL_VRAM_REGIONS[region.name] ?? region.name,
                                 percent: (region.used / memoryTotal) * 100,
                                 used: region.used,
                                 total: memoryTotal,
@@ -2741,6 +2878,9 @@ export default class GpuMonitor extends Monitor {
                         if(aPoints !== bPoints) return bPoints - aPoints;
                         return memory(b) - memory(a);
                     });
+                    // The menu shows the first of them, and a browser alone can hold
+                    // dozens of clients: the rest would only be kept in the history
+                    gpu.topProcesses.splice(GpuMonitor.TOP_PROCESSES_LIMIT);
                 }
 
                 // Sensors

@@ -216,10 +216,17 @@ export type IntelActivity = { GFX?: number; pipes: { name: string; percent: numb
  * Activity of the GPU: the per engine numbers of a sample, the sleep residency of the
  * GT when there is no sample or it carries no engine at all, and no activity at all
  * rather than a wrong one when neither source is usable.
+ *
+ * With preferResidency the engines are still reported as pipes but the residency is
+ * what GFX reports. A sample built from fdinfo covers only the DRM clients its reader
+ * is allowed to see, which makes its engines a breakdown of the GPU rather than the
+ * activity of it: the residency of the GT is the only number that also counts the
+ * processes of the other users and the work the kernel does on nobody's behalf.
  */
 export function intelActivity(
     sample: IntelInfoRaw | undefined,
-    residency: number | undefined
+    residency: number | undefined,
+    preferResidency: boolean = false
 ): IntelActivity {
     const pipes: { name: string; percent: number }[] = [];
     const engines = sample?.engines ?? {};
@@ -229,7 +236,7 @@ export function intelActivity(
         pipes.push({ name, percent: busy });
     }
 
-    if(pipes.length > 0) {
+    if(pipes.length > 0 && !(preferResidency && residency != null)) {
         const render = pipes.find(pipe => pipe.name.startsWith('Render/3D'));
         return {
             GFX: render ? render.percent : Math.max(...pipes.map(pipe => pipe.percent)),
@@ -312,6 +319,131 @@ export function intelVram(sample: IntelInfoRaw | undefined): IntelVram | undefin
         list.push({ name, used: value });
     }
     return { used, regions: list };
+}
+
+/** A descriptor open on /dev/dri: the process holding it and its fdinfo text */
+export type IntelFdinfo = { pid: number; name: string; content: string };
+
+/** The engine classes of the kernel, under the names intel_gpu_top gives them */
+const FDINFO_ENGINES: { [engine: string]: string } = {
+    rcs: 'Render/3D',
+    bcs: 'Blitter',
+    vcs: 'Video',
+    vecs: 'VideoEnhance',
+    ccs: 'Compute',
+};
+const FDINFO_UNITS: { [unit: string]: number } = { KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3 };
+
+/**
+ * The drm- lines of every descriptor, by client id: a descriptor whose fdinfo carries no
+ * client id is not a DRM client, and one of another device is not this GPU's. The same
+ * client can be open more than once, through a dup() or across a fork, and is counted
+ * once. The descriptors are taken in the order of their keys rather than the order they
+ * were read in, so a client shared by two processes always lands on the same one.
+ */
+function parseFdinfo(descriptors: Map<string, IntelFdinfo>, pdev: string) {
+    const clients = new Map<string, IntelFdinfo & { keys: { [key: string]: string } }>();
+    const sorted = Array.from(descriptors.entries()).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+
+    for(const [, descriptor] of sorted) {
+        const keys: { [key: string]: string } = {};
+        for(const line of descriptor.content.split('\n')) {
+            const colon = line.indexOf(':');
+            if(line.startsWith('drm-') && colon > 0)
+                keys[line.substring(0, colon)] = line.substring(colon + 1).trim();
+        }
+
+        const id = keys['drm-client-id'];
+        if(!id || clients.has(id)) continue;
+        if(keys['drm-pdev']?.toLowerCase() !== pdev.toLowerCase()) continue;
+        clients.set(id, { ...descriptor, keys });
+    }
+    return clients;
+}
+
+/**
+ * A sample in the shape of intel_gpu_top's, built from two scans of the descriptors open
+ * on /dev/dri, which is where intel_gpu_top itself takes its client table from. xe
+ * reports drm-cycles-<class> and drm-total-cycles-<class> per client, and the percentage
+ * is the ratio of their deltas over the capacity of the class, the way gputop computes
+ * it. Clients are merged by process, and the engines are the sum over them. Memory is
+ * drm-resident-<region>, which needs no previous scan to be a reading.
+ */
+export function intelFdinfoSample(
+    previous: Map<string, IntelFdinfo>,
+    current: Map<string, IntelFdinfo>,
+    pdev: string
+): IntelInfoRaw {
+    const before = parseFdinfo(previous, pdev);
+    const engines: { [name: string]: number } = {};
+    const busy: { [pid: string]: { [name: string]: number } } = {};
+    const memory: { [pid: string]: { [region: string]: number } } = {};
+    const names: { [pid: string]: string } = {};
+
+    for(const [id, client] of parseFdinfo(current, pdev)) {
+        const last = before.get(id);
+        const pid = String(client.pid);
+        names[pid] = client.name;
+        busy[pid] ??= {};
+        memory[pid] ??= {};
+
+        for(const key in client.keys) {
+            const value = client.keys[key];
+
+            if(key.startsWith('drm-resident-')) {
+                const [size, unit] = value.split(' ');
+                const bytes = parseInt(size, 10) * (FDINFO_UNITS[unit] ?? 1);
+                const region = key.substring(13);
+                if(bytes > 0) memory[pid][region] = (memory[pid][region] ?? 0) + bytes;
+                continue;
+            }
+
+            // A client seen for the first time has nothing to take a delta against
+            if(!last || !key.startsWith('drm-cycles-')) continue;
+
+            const engine = key.substring(11);
+            const name = FDINFO_ENGINES[engine] ?? engine;
+            const cycles = parseInt(value, 10) - parseInt(last.keys[key] ?? '', 10);
+            const total =
+                parseInt(client.keys[`drm-total-cycles-${engine}`], 10) -
+                parseInt(last.keys[`drm-total-cycles-${engine}`] ?? '', 10);
+            if(!(total > 0) || !(cycles >= 0)) continue;
+
+            // The cycles are summed over every instance of the class, so the ratio
+            // reaches the capacity times 100% and the clamp belongs after the division
+            const capacity = parseInt(client.keys[`drm-engine-capacity-${engine}`] ?? '1', 10);
+            const percent = Math.min(100, (cycles / total / capacity) * 100);
+            busy[pid][name] = Math.min(100, (busy[pid][name] ?? 0) + percent);
+            engines[name] = (engines[name] ?? 0) + percent;
+        }
+    }
+
+    // In the order intel_gpu_top lists them, with any class it does not name after them
+    const order = Object.values(FDINFO_ENGINES).filter(name => name in engines);
+    for(const name in engines) if(!order.includes(name)) order.push(name);
+
+    const sampleEngines: { [name: string]: IntelEngine } = {};
+    for(const name of order)
+        sampleEngines[name] = { busy: Math.min(100, engines[name]), unit: '%' };
+
+    const sampleClients: NonNullable<IntelInfoRaw['clients']> = {};
+    for(const pid in names) {
+        const engineClasses: { [name: string]: { busy: string; unit: string } } = {};
+        for(const name in busy[pid])
+            engineClasses[name] = { busy: String(busy[pid][name]), unit: '%' };
+
+        const regions: { [region: string]: { [field: string]: string } } = {};
+        for(const region in memory[pid])
+            regions[region] = { resident: String(memory[pid][region]) };
+
+        sampleClients[pid] = {
+            name: names[pid],
+            pid,
+            'engine-classes': engineClasses,
+            memory: regions,
+        };
+    }
+    return { engines: sampleEngines, clients: sampleClients };
 }
 
 /**

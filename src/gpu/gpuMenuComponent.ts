@@ -2026,6 +2026,9 @@ export default class GpuMenuComponent {
         this.shown = true;
 
         Utils.gpuMonitor.listen(this, 'displays', this.updateDisplays.bind(this));
+        // Says that the per process table is on screen: reading it costs a monitor more
+        // than the rest of the data does, so it is only read while something shows it
+        Utils.gpuMonitor.listen(this, 'gpuUpdateClients', () => {});
 
         const gpuData = Utils.gpuMonitor.getCurrentValue('gpu') as Map<
             string,
@@ -2068,6 +2071,7 @@ export default class GpuMenuComponent {
         this.cancelDisplayUpdate();
         this.clear();
         Utils.gpuMonitor.unlisten(this, 'displays');
+        Utils.gpuMonitor.unlisten(this, 'gpuUpdateClients');
     }
 
     public clear() {
