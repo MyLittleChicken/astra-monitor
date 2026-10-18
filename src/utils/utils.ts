@@ -2141,8 +2141,9 @@ export default class Utils {
                         return;
                     }
 
+                    let enumerator;
                     try {
-                        const enumerator = sourceObject.enumerate_children_finish(result);
+                        enumerator = sourceObject.enumerate_children_finish(result);
 
                         let fileInfo;
                         const files = [];
@@ -2154,6 +2155,14 @@ export default class Utils {
                         resolve(files);
                     } catch(e: any) {
                         reject(new Error(`Error reading directory: ${e.message}`));
+                    } finally {
+                        // Otherwise the directory fd stays open until the garbage
+                        // collector runs, on the path a throw from next_file() takes too
+                        try {
+                            enumerator?.close(null);
+                        } catch(_e) {
+                            // Nothing left to do if it won't close
+                        }
                     }
                 }
             );
@@ -2162,8 +2171,11 @@ export default class Utils {
 
     static listDirAsync(
         path: string,
-        options: { folders: boolean; files: boolean } = { folders: true, files: true }
-    ): Promise<{ name: string; isFolder: boolean }[]> {
+        options: { folders: boolean; files: boolean; symlinks?: boolean } = {
+            folders: true,
+            files: true,
+        }
+    ): Promise<{ name: string; isFolder: boolean; target?: string }[]> {
         return new Promise((resolve, reject) => {
             // Check if the path is valid and not empty
             if(!path || typeof path !== 'string') {
@@ -2180,8 +2192,16 @@ export default class Utils {
             }
 
             dir.enumerate_children_async(
-                'standard::name,standard::type',
-                Gio.FileQueryInfoFlags.NONE,
+                options.symlinks
+                    ? 'standard::name,standard::type,standard::symlink-target'
+                    : 'standard::name,standard::type',
+                // Following a symlink costs a stat() of its target. A caller that asks
+                // for the targets wants the strings, and stat'ing them would make the
+                // loop below wait on whatever they point at, an unreachable mount
+                // included, so they are read as they are written.
+                options.symlinks
+                    ? Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS
+                    : Gio.FileQueryInfoFlags.NONE,
                 0,
                 null,
                 (sourceObject, result) => {
@@ -2190,8 +2210,9 @@ export default class Utils {
                         return;
                     }
 
+                    let enumerator;
                     try {
-                        const enumerator = sourceObject.enumerate_children_finish(result);
+                        enumerator = sourceObject.enumerate_children_finish(result);
 
                         let fileInfo;
                         const files = [];
@@ -2204,11 +2225,24 @@ export default class Utils {
                             if(options.files === false && !isFolder) continue;
 
                             const name = fileInfo.get_name();
-                            files.push({ name, isFolder });
+                            // get_symlink_target() is a critical when the attribute was
+                            // not asked for, or the entry is not a symlink
+                            const target = fileInfo.has_attribute('standard::symlink-target')
+                                ? (fileInfo.get_symlink_target() ?? undefined)
+                                : undefined;
+                            files.push({ name, isFolder, target });
                         }
                         resolve(files);
                     } catch(e: any) {
                         reject(new Error(`Error reading directory: ${e.message}`));
+                    } finally {
+                        // Otherwise the directory fd stays open until the garbage
+                        // collector runs, on the path a throw from next_file() takes too
+                        try {
+                            enumerator?.close(null);
+                        } catch(_e) {
+                            // Nothing left to do if it won't close
+                        }
                     }
                 }
             );
