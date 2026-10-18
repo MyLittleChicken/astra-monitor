@@ -91,31 +91,135 @@ export function parseSysfsNumber(content: string): number | undefined {
 /**
  * Activity of a GPU without intel_gpu_top: the time it didn't spend in the rc6 sleep
  * state is a good enough approximation. Takes the residency counter in milliseconds
- * and the elapsed time in seconds, returns undefined when the counter wrapped around.
+ * and the elapsed time in seconds, returns undefined when the counter wrapped around,
+ * when there is nothing to compare against yet, or when no time has passed.
  */
 export function intelActivityFromRc6(
-    previousResidency: number,
-    currentResidency: number,
+    previousResidency: number | undefined,
+    currentResidency: number | undefined,
     elapsed: number
 ): number | undefined {
+    if(previousResidency == null || currentResidency == null || elapsed <= 0) return undefined;
     const rc6Percent = ((currentResidency - previousResidency) / (elapsed * 1000)) * 100;
     if(rc6Percent < 0) return undefined;
     return Math.min(100, Math.max(0, 100 - rc6Percent));
 }
 
+/**
+ * The rate at which the sleep counter of every GT advanced, 1 meaning it slept for the
+ * whole of the elapsed time. A GT with nothing to compare against, or whose counter
+ * went backwards, is left out.
+ */
+export function intelResidencyRates(
+    previous: { [gt: string]: number } | undefined,
+    current: { [gt: string]: number },
+    elapsed: number
+): { [gt: string]: number } {
+    const rates: { [gt: string]: number } = {};
+    if(elapsed <= 0) return rates;
+
+    for(const gt in current) {
+        const before = previous?.[gt];
+        if(before == null) continue;
+        // Nothing sleeps for longer than the time that passed, so a rate above 1 is a
+        // mis-measured interval and is left out rather than taken as a full one:
+        // CLOCK_MONOTONIC stops while the machine is suspended and the counter of a GT
+        // that is only power gated does not
+        const rate = (current[gt] - before) / (elapsed * 1000);
+        if(rate >= 0 && rate <= 1) rates[gt] = rate;
+    }
+    return rates;
+}
+
+/**
+ * How fast a sleep counter has to have been seen advancing for that reading to be taken
+ * as the rate of a GT that was asleep throughout. Sampled over sixty one second windows
+ * of an idle Panther Lake, the render GT's reached 0.845 to 0.947 of the clock and the
+ * media GT's 0.701 to 0.845, while a saturated GT reads 0 to 0.08.
+ *
+ * A quarter of the clock sits between the two with room on both sides, and clear of the
+ * rates a driver converting the counter against the wrong reference clock would produce:
+ * those are ratios of the usual Intel frequencies, 19.2/25 = 0.768 (which is what the
+ * media GT looks like), 19.2/24 = 0.8, 24/25 = 0.96, and 19.2/38.4 = 0.5 for a plain
+ * factor of two. The ceiling of reading it this way is a part whose counter runs slower
+ * still at idle: that GT is never marked and keeps reporting what it did before any of
+ * this, which is loud enough to be reported and is one number to change here. Learning a
+ * mark only from an interval whose gtidle/idle_status read gt-c6 at both ends would say
+ * something about the state of the GT rather than about a magnitude, at the cost of a
+ * read per GT per tick and of a guarantee that is still only a sample.
+ */
+const RESIDENCY_ASLEEP_RATE = 0.25;
+
+/**
+ * The fastest rate every GT's sleep counter has been seen to advance at, which is that
+ * GT's idea of having been asleep the whole time. A GT is marked only once a rate of
+ * its own has been seen, so the mark is learned from the hardware rather than assumed.
+ *
+ * A rate measured while the GT was busy says nothing about how fast its counter runs
+ * when it is not, so it is not learned: taken as the asleep rate it would measure the
+ * GT against itself and report a saturated GPU as an idle one. Nor is a rate the clock
+ * says is impossible, the way intelResidencyRates leaves one out, since a mark that is
+ * too high does not come back down on its own and would report a GPU that is asleep as
+ * busy for as long as the monitor runs.
+ */
+export function intelMaxRates(
+    previous: { [gt: string]: number } | undefined,
+    rates: { [gt: string]: number }
+): { [gt: string]: number } {
+    const maxRates = { ...previous };
+    for(const gt in rates) {
+        if(rates[gt] < RESIDENCY_ASLEEP_RATE || rates[gt] > 1) continue;
+        maxRates[gt] = Math.max(maxRates[gt] ?? 0, rates[gt]);
+    }
+    return maxRates;
+}
+
+/**
+ * Activity of the busiest GT of a GPU that has more than one: xe splits the GPU into a
+ * render GT and a media GT, each sleeping on its own, so a video decode leaves the
+ * render GT asleep while the media one works, and the activity of the GPU is the one
+ * that is awake.
+ *
+ * A rate is measured against the fastest one ever seen for that GT rather than against
+ * the elapsed time, because the counters do not all advance at the rate of the clock.
+ * On Panther Lake the media GT's reaches 0.701 to 0.845 of it with nothing decoding and
+ * the render GT's 0.845 to 0.947, so read as a fraction of the elapsed time a GT that
+ * has been asleep throughout reports some 20% busy and can never reach 0. The rate of a
+ * single interval wanders by about a tenth, so the mark ends up at the top of that band
+ * and an idle GPU keeps reading a few per cent rather than none.
+ * Taking the fastest rate seen as that GT's idea of 'asleep' calibrates it away, and a
+ * mark recorded below the rate being measured is not allowed to report more than it
+ * measures. A GT with no mark yet — one that has not been seen asleep since the monitor
+ * started — reads as though its counter kept up with the clock, which is the number it
+ * reported before any of this.
+ */
+export function intelActivityFromRates(
+    rates: { [gt: string]: number },
+    maxRates: { [gt: string]: number } | undefined
+): number | undefined {
+    let busiest: number | undefined;
+    for(const gt in rates) {
+        // A mark that is not an asleep rate is no mark: the accumulator never stores one,
+        // and measuring a GT against a rate of its own while it was busy would report a
+        // saturated GPU as an idle one
+        const mark = maxRates?.[gt] ?? 0;
+        const asleep = Math.max(rates[gt], mark >= RESIDENCY_ASLEEP_RATE ? mark : 1);
+        const busy = Math.min(100, Math.max(0, 100 * (1 - rates[gt] / asleep)));
+        busiest = busiest == null ? busy : Math.max(busiest, busy);
+    }
+    return busiest;
+}
+
 export type IntelActivity = { GFX?: number; pipes: { name: string; percent: number }[] };
 
 /**
- * Activity of the GPU: the per engine numbers when intel_gpu_top is running, the rc6
- * residency delta when it is absent or its sample carries no engine at all. Takes the
- * residency counter in milliseconds and the elapsed time in seconds, and reports no
- * activity at all rather than a wrong one when neither source is usable.
+ * Activity of the GPU: the per engine numbers of a sample, the sleep residency of the
+ * GT when there is no sample or it carries no engine at all, and no activity at all
+ * rather than a wrong one when neither source is usable.
  */
 export function intelActivity(
     sample: IntelInfoRaw | undefined,
-    previousResidency: number | undefined,
-    currentResidency: number | undefined,
-    elapsed: number
+    residency: number | undefined
 ): IntelActivity {
     const pipes: { name: string; percent: number }[] = [];
     const engines = sample?.engines ?? {};
@@ -133,10 +237,7 @@ export function intelActivity(
         };
     }
 
-    if(previousResidency == null || currentResidency == null || elapsed <= 0) return { pipes };
-
-    const GFX = intelActivityFromRc6(previousResidency, currentResidency, elapsed);
-    return GFX == null ? { pipes } : { GFX, pipes };
+    return residency == null ? { pipes } : { GFX: residency, pipes };
 }
 
 /**
@@ -164,13 +265,20 @@ export function intelPower(
 
 /**
  * Current frequency in MHz, rounded for display: the number of a sample when
- * intel_gpu_top is running, the contents of gt_cur_freq_mhz when it is absent.
+ * intel_gpu_top is running, and sysfs when it is absent.
+ *
+ * Of the two sysfs readings the frequency read back from the hardware is the one to
+ * report, as the sample's actual one is. It reads 0 while the GT sleeps and at times
+ * while it is awake, and the requested frequency, which never leaves the range the
+ * driver allows, stands in for it then. i915 has the requested one only.
  */
 export function intelFrequency(
     sample: IntelInfoRaw | undefined,
-    curFreq: string
+    curFreq: string,
+    actFreq: string = ''
 ): number | undefined {
-    const frequency = sample?.frequency?.actual ?? parseSysfsNumber(curFreq);
+    const sysfs = parseSysfsNumber(actFreq) || parseSysfsNumber(curFreq);
+    const frequency = sample?.frequency?.actual ?? sysfs;
     if(frequency == null || isNaN(frequency)) return undefined;
     return Math.round(frequency);
 }

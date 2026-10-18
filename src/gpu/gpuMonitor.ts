@@ -33,8 +33,12 @@ import {
     INTEL_SAMPLE_FLUSH,
     IntelInfoRaw,
     intelActivity,
+    intelActivityFromRates,
+    intelActivityFromRc6,
     intelFrequency,
+    intelMaxRates,
     intelPower,
+    intelResidencyRates,
     intelVram,
     isIntegratedIntelGpu,
     parseIntelGpuSample,
@@ -377,6 +381,10 @@ type IntelDevice = {
     card: string;
     cardPath: string;
     integrated: boolean;
+    // xe only: the GTs of the GPU and the render one among them. i915 keeps a single
+    // set of attributes on the card node and leaves these empty.
+    gts: string[];
+    renderGt?: string;
 };
 
 export default class GpuMonitor extends Monitor {
@@ -391,7 +399,19 @@ export default class GpuMonitor extends Monitor {
 
     private intelGpus: Map<string, IntelDevice> = new Map();
     private intelSamples: Map<string, IntelInfoRaw> = new Map();
-    private intelPrevious: Map<string, { time: number; rc6?: number; energy?: number }> = new Map();
+    private intelPrevious: Map<
+        string,
+        {
+            time: number;
+            rc6?: number;
+            energy?: number;
+            residencies?: { [gt: string]: number };
+            // The fastest rate every GT's sleep counter has been seen to advance at,
+            // which is that GT's idea of having been asleep the whole time
+            maxRates?: { [gt: string]: number };
+        }
+    > = new Map();
+    private intelWarned: Set<string> = new Set();
     private intelRaplPath?: string | null;
     private intelCpuTempPath?: string | null;
     private systemMemoryTotal?: number | null;
@@ -488,6 +508,7 @@ export default class GpuMonitor extends Monitor {
         this.infoPipesCaches.clear();
         this.intelSamples.clear();
         this.intelPrevious.clear();
+        this.intelWarned.clear();
     }
 
     override start() {
@@ -612,6 +633,7 @@ export default class GpuMonitor extends Monitor {
         this.intelGpus.clear();
         this.intelSamples.clear();
         this.intelPrevious.clear();
+        this.intelWarned.clear();
     }
 
     update(): boolean {
@@ -2268,13 +2290,28 @@ export default class GpuMonitor extends Monitor {
                     });
                     const card = nodes.find(node => /^card\d+$/.test(node.name));
                     if(!card) return undefined;
+
+                    // Where everything is read from depends on the driver, and the
+                    // symlink of the sysfs node is the authoritative answer: the drivers
+                    // of a GpuInfo are a line of lspci output, which is not always there.
+                    const cardPath = `/sys/class/drm/${card.name}`;
+                    const driver = await Utils.getPciDriverAsync(uuid);
+                    const { gts, render } =
+                        driver === 'xe'
+                            ? await this.findIntelGts(cardPath)
+                            : { gts: [] as string[], render: undefined };
+                    if(driver === 'xe' && gts.length === 0)
+                        Utils.warn(`Found no GT of the Intel GPU ${uuid}, which xe drives`);
+
                     return {
                         uuid,
                         device: {
                             gpu,
                             card: card.name,
-                            cardPath: `/sys/class/drm/${card.name}`,
+                            cardPath,
                             integrated: isIntegratedIntelGpu(uuid),
+                            gts,
+                            renderGt: render,
                         } as IntelDevice,
                     };
                 } catch(e: any) {
@@ -2306,6 +2343,61 @@ export default class GpuMonitor extends Monitor {
                 flush: { match: INTEL_SAMPLE_FLUSH },
             });
             this.updateIntelGpuTasks.set(uuid, task);
+        }
+    }
+
+    /** Logs once per subject: a layout that cannot be read stays broken every tick */
+    private warnIntelOnce(key: string, message: string) {
+        if(this.intelWarned.has(key)) return;
+        this.intelWarned.add(key);
+        Utils.warn(message);
+    }
+
+    /**
+     * The GTs of an xe GPU as paths, and the render one among them: xe splits the GPU
+     * into a render GT and a media GT, each with a frequency and a sleep residency of
+     * its own, and names them in gtidle/name ('gt0-rc', 'gt1-mc'). Which number the
+     * render GT has is not fixed, so the names are read rather than assumed.
+     */
+    private async findIntelGts(cardPath: string): Promise<{ gts: string[]; render?: string }> {
+        try {
+            const devicePath = `${cardPath}/device`;
+            const tiles = (await Utils.listDirAsync(devicePath, { folders: true, files: false }))
+                .filter(node => /^tile\d+$/.test(node.name))
+                .map(node => `${devicePath}/${node.name}`)
+                .sort();
+
+            const gts = (
+                await Promise.all(
+                    tiles.map(tile =>
+                        Utils.listDirAsync(tile, { folders: true, files: false })
+                            .then(nodes =>
+                                nodes
+                                    .filter(node => /^gt\d+$/.test(node.name))
+                                    .map(node => `${tile}/${node.name}`)
+                            )
+                            .catch(() => [] as string[])
+                    )
+                )
+            )
+                .flat()
+                .sort();
+
+            const names = await Promise.all(
+                gts.map(gt =>
+                    Utils.readFileAsync(`${gt}/gtidle/name`, true).then(name => name.trim())
+                )
+            );
+            const render = names.findIndex(name => name.endsWith('-rc'));
+            if(render === -1 && gts.length > 0)
+                this.warnIntelOnce(
+                    `${cardPath}:render`,
+                    `Found no render GT of the Intel GPU at ${cardPath}, reading ${gts[0]}`
+                );
+            return { gts, render: gts[render === -1 ? 0 : render] };
+        } catch(e: any) {
+            Utils.warn(`Failed to list the GTs of the Intel GPU at ${cardPath}`);
+            return { gts: [] };
         }
     }
 
@@ -2406,25 +2498,65 @@ export default class GpuMonitor extends Monitor {
         ]);
 
         const gpus = new Map<string, GenericGpuInfo>();
+        const generation = this.gpuTaskGeneration;
 
         await Promise.all(
             Array.from(this.intelGpus.entries()).map(async ([uuid, device]) => {
                 const sample = this.intelSamples.get(uuid);
                 const cardPath = device.cardPath;
+                const xe = device.gts.length > 0;
 
                 // The CPU package is shared by the integrated GPU only
                 const energyPath = device.integrated ? raplPath : null;
                 const cpuTempPath = device.integrated ? tempPath : null;
 
-                const [curFreq, maxFreq, minFreq, rc6Residency, energy, temperature] =
-                    await Promise.all([
-                        Utils.readFileAsync(`${cardPath}/gt_cur_freq_mhz`, true),
-                        Utils.readFileAsync(`${cardPath}/gt_max_freq_mhz`, true),
-                        Utils.readFileAsync(`${cardPath}/gt_min_freq_mhz`, true),
-                        Utils.readFileAsync(`${cardPath}/power/rc6_residency_ms`, true),
-                        energyPath ? Utils.readFileAsync(energyPath, true) : Promise.resolve(''),
-                        cpuTempPath ? Utils.readFileAsync(cpuTempPath, true) : Promise.resolve(''),
-                    ]);
+                // xe reports the frequency per GT, under the PCI device. act_freq is the
+                // one read back from the hardware, where cur_freq is the requested one
+                // and sits at the efficient floor for as long as the GT sleeps; act_freq
+                // also reads 0 at times while the GT is awake, which the requested one
+                // is kept as the fallback for.
+                const render = device.renderGt;
+                const actPath = xe ? `${render}/freq0/act_freq` : null;
+                const curPath = xe ? `${render}/freq0/cur_freq` : `${cardPath}/gt_cur_freq_mhz`;
+                const maxPath = xe ? `${render}/freq0/max_freq` : `${cardPath}/gt_max_freq_mhz`;
+                const minPath = xe ? `${render}/freq0/min_freq` : `${cardPath}/gt_min_freq_mhz`;
+                const rc6Path = xe ? null : `${cardPath}/power/rc6_residency_ms`;
+
+                const [
+                    actFreq,
+                    curFreq,
+                    maxFreq,
+                    minFreq,
+                    rc6Residency,
+                    energy,
+                    temperature,
+                    gtResidencies,
+                ] = await Promise.all([
+                    actPath ? Utils.readFileAsync(actPath, true) : Promise.resolve(''),
+                    Utils.readFileAsync(curPath, true),
+                    Utils.readFileAsync(maxPath, true),
+                    Utils.readFileAsync(minPath, true),
+                    rc6Path ? Utils.readFileAsync(rc6Path, true) : Promise.resolve(''),
+                    energyPath ? Utils.readFileAsync(energyPath, true) : Promise.resolve(''),
+                    cpuTempPath ? Utils.readFileAsync(cpuTempPath, true) : Promise.resolve(''),
+                    // Every xe GT sleeps on its own, so the one that is awake is the
+                    // activity of the GPU: a video decode keeps the media GT busy while
+                    // the render GT stays in its sleep state
+                    Promise.all(
+                        device.gts.map(gt =>
+                            Utils.readFileAsync(`${gt}/gtidle/idle_residency_ms`, true)
+                        )
+                    ),
+                ]);
+                // Stamped next to the counters it is the interval of, and before anything
+                // else is awaited
+                const now = GLib.get_monotonic_time();
+
+                const residencies: { [gt: string]: number } = {};
+                device.gts.forEach((gt, index) => {
+                    const value = parseSysfsNumber(gtResidencies[index]);
+                    if(value != null) residencies[gt] = value;
+                });
 
                 const gpu: GenericGpuInfo = {
                     id: uuid,
@@ -2456,17 +2588,34 @@ export default class GpuMonitor extends Monitor {
                 }
 
                 // Counters deltas
-                const now = GLib.get_monotonic_time();
                 const previous = this.intelPrevious.get(uuid);
                 const elapsed = previous ? (now - previous.time) / 1000000 : 0;
                 const rc6Value = parseSysfsNumber(rc6Residency);
                 const energyValue = parseSysfsNumber(energy);
-                this.intelPrevious.set(uuid, { time: now, rc6: rc6Value, energy: energyValue });
+
+                // What every GT counts as having been asleep the whole time, kept as the
+                // fastest rate it has been seen to advance at
+                const rates = intelResidencyRates(previous?.residencies, residencies, elapsed);
+                const maxRates = intelMaxRates(previous?.maxRates, rates);
+
+                this.intelPrevious.set(uuid, {
+                    time: now,
+                    rc6: rc6Value,
+                    energy: energyValue,
+                    residencies,
+                    maxRates,
+                });
 
                 //Activity
-                const activity = intelActivity(sample, previous?.rc6, rc6Value, elapsed);
+                // Against the mark as it stood before this interval: the first one has
+                // none and reads as it did before there was any calibration
+                const residency = xe
+                    ? intelActivityFromRates(rates, previous?.maxRates)
+                    : intelActivityFromRc6(previous?.rc6, rc6Value, elapsed);
+                const activity = intelActivity(sample, residency);
                 gpu.activity.pipes = activity.pipes;
-                if(activity.GFX != null) gpu.activity.GFX = activity.GFX;
+                // A reading that is not a number would reach the header as 'NaN%'
+                if(activity.GFX != null && !isNaN(activity.GFX)) gpu.activity.GFX = activity.GFX;
 
                 //Vram: an integrated GPU allocates from system memory, so the memory of
                 //its clients is a share of it and not of a VRAM of its own. A discrete GPU
@@ -2615,7 +2764,16 @@ export default class GpuMonitor extends Monitor {
                     gpu.sensors.list?.push(sensor);
                 };
 
-                const currentFreq = intelFrequency(sample, curFreq);
+                const currentFreq = intelFrequency(sample, curFreq, actFreq);
+
+                // Nothing read and nothing in the log to say why is the state this is
+                // worth a line for: the layout of the driver is what can change here
+                if(xe && elapsed > 0 && currentFreq == null && residency == null)
+                    this.warnIntelOnce(
+                        uuid,
+                        `Read no frequency and no sleep residency of the Intel GPU ${uuid} ` +
+                            `under ${render}`
+                    );
                 if(currentFreq != null)
                     addSensor({
                         category: 'Clocks',
@@ -2625,7 +2783,8 @@ export default class GpuMonitor extends Monitor {
                         priority: GpuSensorPriority.MAX,
                     });
 
-                const requestedFreq = sample?.frequency?.requested;
+                const requestedFreq =
+                    sample?.frequency?.requested ?? (xe ? parseSysfsNumber(curFreq) : undefined);
                 if(requestedFreq != null && !isNaN(requestedFreq))
                     addSensor({
                         category: 'Clocks',
@@ -2748,6 +2907,10 @@ export default class GpuMonitor extends Monitor {
                 gpus.set(uuid, gpu);
             })
         );
+
+        // Nothing is pushed for a task that was stopped while this was reading: the
+        // history would gain a sample of a monitor that is no longer running
+        if(this.isGpuTaskStale(generation)) return false;
 
         this.pushGpuUpdate(gpus);
         return true;
