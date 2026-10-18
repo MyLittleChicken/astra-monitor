@@ -3081,6 +3081,20 @@ export default class Utils {
     }
 
     /**
+     * Whether intel_gpu_top has anything to say about the Intel GPUs of the machine: it
+     * refuses the ones the xe driver owns, whose data comes from sysfs and from the DRM
+     * clients instead, so on those it is not a dependency to warn about.
+     */
+    static async intelGpuTopAppliesAsync(gpus: GpuInfo[]): Promise<boolean> {
+        const drivers = await Promise.all(
+            gpus
+                .filter(gpu => Utils.isIntelGpu(gpu))
+                .map(gpu => Utils.getPciDriverAsync(Utils.getGpuUUID(gpu)))
+        );
+        return drivers.some(driver => driver !== 'xe');
+    }
+
+    /**
      * The kernel driver bound to a PCI device, read from the driver symlink of its sysfs
      * node: the authoritative answer, where the drivers of a GpuInfo are a line of lspci
      * output. Resolves to undefined when no driver is bound, or the node is not there.
