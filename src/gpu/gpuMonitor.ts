@@ -2352,6 +2352,8 @@ export default class GpuMonitor extends Monitor {
         const timer = Math.round(Math.max(500, this.updateFrequency * 1000));
 
         for(const [uuid, device] of this.intelGpus) {
+            // intel_gpu_top refuses xe GPUs
+            if(device.gts.length > 0) continue;
             if(this.updateIntelGpuTasks.get(uuid)?.isRunning) continue;
 
             const task = new ContinuousTaskManager();

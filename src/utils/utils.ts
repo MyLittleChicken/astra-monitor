@@ -3058,6 +3058,16 @@ export default class Utils {
         return `${gpuInfo.domain}:${gpuInfo.bus}.${gpuInfo.slot}`;
     }
 
+    /** Whether any Intel GPU is not on xe, the driver intel_gpu_top refuses */
+    static async intelGpuTopAppliesAsync(gpus: GpuInfo[]): Promise<boolean> {
+        const drivers = await Promise.all(
+            gpus
+                .filter(gpu => Utils.isIntelGpu(gpu))
+                .map(gpu => Utils.getPciDriverAsync(Utils.getGpuUUID(gpu)))
+        );
+        return drivers.some(driver => driver !== 'xe');
+    }
+
     /** Driver bound to a PCI device, from its sysfs driver symlink; undefined when none is */
     static getPciDriverAsync(pciAddress: string): Promise<string | undefined> {
         return new Promise(resolve => {
