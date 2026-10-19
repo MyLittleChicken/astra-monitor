@@ -3046,6 +3046,31 @@ export default class Utils {
         return `${gpuInfo.domain}:${gpuInfo.bus}.${gpuInfo.slot}`;
     }
 
+    /** Driver bound to a PCI device, from its sysfs driver symlink; undefined when none is */
+    static getPciDriverAsync(pciAddress: string): Promise<string | undefined> {
+        return new Promise(resolve => {
+            try {
+                const link = Gio.File.new_for_path(`/sys/bus/pci/devices/${pciAddress}/driver`);
+                link.query_info_async(
+                    'standard::symlink-target',
+                    Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                    GLib.PRIORITY_DEFAULT,
+                    null,
+                    (file, result) => {
+                        try {
+                            const target = file?.query_info_finish(result).get_symlink_target();
+                            resolve(target ? GLib.path_get_basename(target) : undefined);
+                        } catch(_e) {
+                            resolve(undefined);
+                        }
+                    }
+                );
+            } catch(_e) {
+                resolve(undefined);
+            }
+        });
+    }
+
     static parseCpuPresentFile(content: string): number[] {
         const presentParts = content.trim().split(',');
         const presentCpus: number[] = [];

@@ -91,31 +91,97 @@ export function parseSysfsNumber(content: string): number | undefined {
 /**
  * Activity of a GPU without intel_gpu_top: the time it didn't spend in the rc6 sleep
  * state is a good enough approximation. Takes the residency counter in milliseconds
- * and the elapsed time in seconds, returns undefined when the counter wrapped around.
+ * and the elapsed time in seconds, returns undefined when the counter wrapped around,
+ * when there is nothing to compare against yet, or when no time has passed.
  */
 export function intelActivityFromRc6(
-    previousResidency: number,
-    currentResidency: number,
+    previousResidency: number | undefined,
+    currentResidency: number | undefined,
     elapsed: number
 ): number | undefined {
+    if(previousResidency == null || currentResidency == null || elapsed <= 0) return undefined;
     const rc6Percent = ((currentResidency - previousResidency) / (elapsed * 1000)) * 100;
     if(rc6Percent < 0) return undefined;
     return Math.min(100, Math.max(0, 100 - rc6Percent));
 }
 
+/**
+ * The rate at which the sleep counter of every GT advanced, 1 meaning it slept for the
+ * whole of the elapsed time. A GT with nothing to compare against, or whose counter
+ * went backwards, is left out.
+ */
+export function intelResidencyRates(
+    previous: { [gt: string]: number } | undefined,
+    current: { [gt: string]: number },
+    elapsed: number
+): { [gt: string]: number } {
+    const rates: { [gt: string]: number } = {};
+    if(elapsed <= 0) return rates;
+
+    for(const gt in current) {
+        const before = previous?.[gt];
+        if(before == null) continue;
+        // A rate above 1 is a mis-measured interval, not a full one: CLOCK_MONOTONIC
+        // stops while suspended and the counter of a power gated GT does not
+        const rate = (current[gt] - before) / (elapsed * 1000);
+        if(rate >= 0 && rate <= 1) rates[gt] = rate;
+    }
+    return rates;
+}
+
+/**
+ * Slowest rate a sleep counter can advance at for its GT to count as asleep: idle GTs
+ * measured 0.70 to 0.95 of the clock on Panther Lake, saturated ones 0 to 0.08.
+ */
+const RESIDENCY_ASLEEP_RATE = 0.25;
+
+/**
+ * The fastest rate every GT's sleep counter has been seen to advance at: its rate while
+ * asleep. A busy rate would measure the GT against itself and one above 1 is not a rate,
+ * so neither is learned, since a mark never comes back down.
+ */
+export function intelMaxRates(
+    previous: { [gt: string]: number } | undefined,
+    rates: { [gt: string]: number }
+): { [gt: string]: number } {
+    const maxRates = { ...previous };
+    for(const gt in rates) {
+        if(rates[gt] < RESIDENCY_ASLEEP_RATE || rates[gt] > 1) continue;
+        maxRates[gt] = Math.max(maxRates[gt] ?? 0, rates[gt]);
+    }
+    return maxRates;
+}
+
+/**
+ * Activity of the busiest GT, each rate measured against that GT's asleep mark rather
+ * than the clock, since the counters don't advance at the rate of the clock. A GT with
+ * no mark yet is measured against the clock.
+ */
+export function intelActivityFromRates(
+    rates: { [gt: string]: number },
+    maxRates: { [gt: string]: number } | undefined
+): number | undefined {
+    let busiest: number | undefined;
+    for(const gt in rates) {
+        // A mark below RESIDENCY_ASLEEP_RATE is not an asleep rate
+        const mark = maxRates?.[gt] ?? 0;
+        const asleep = Math.max(rates[gt], mark >= RESIDENCY_ASLEEP_RATE ? mark : 1);
+        const busy = Math.min(100, Math.max(0, 100 * (1 - rates[gt] / asleep)));
+        busiest = busiest == null ? busy : Math.max(busiest, busy);
+    }
+    return busiest;
+}
+
 export type IntelActivity = { GFX?: number; pipes: { name: string; percent: number }[] };
 
 /**
- * Activity of the GPU: the per engine numbers when intel_gpu_top is running, the rc6
- * residency delta when it is absent or its sample carries no engine at all. Takes the
- * residency counter in milliseconds and the elapsed time in seconds, and reports no
- * activity at all rather than a wrong one when neither source is usable.
+ * Activity of the GPU: the per engine numbers of a sample, the sleep residency of the
+ * GT when there is no sample or it carries no engine at all, and no activity at all
+ * rather than a wrong one when neither source is usable.
  */
 export function intelActivity(
     sample: IntelInfoRaw | undefined,
-    previousResidency: number | undefined,
-    currentResidency: number | undefined,
-    elapsed: number
+    residency: number | undefined
 ): IntelActivity {
     const pipes: { name: string; percent: number }[] = [];
     const engines = sample?.engines ?? {};
@@ -133,10 +199,7 @@ export function intelActivity(
         };
     }
 
-    if(previousResidency == null || currentResidency == null || elapsed <= 0) return { pipes };
-
-    const GFX = intelActivityFromRc6(previousResidency, currentResidency, elapsed);
-    return GFX == null ? { pipes } : { GFX, pipes };
+    return residency == null ? { pipes } : { GFX: residency, pipes };
 }
 
 /**
@@ -164,13 +227,16 @@ export function intelPower(
 
 /**
  * Current frequency in MHz, rounded for display: the number of a sample when
- * intel_gpu_top is running, the contents of gt_cur_freq_mhz when it is absent.
+ * intel_gpu_top is running, and sysfs when it is absent: act_freq on xe, or the requested
+ * frequency while act_freq reads 0 and on i915, which has no other.
  */
 export function intelFrequency(
     sample: IntelInfoRaw | undefined,
-    curFreq: string
+    curFreq: string,
+    actFreq: string = ''
 ): number | undefined {
-    const frequency = sample?.frequency?.actual ?? parseSysfsNumber(curFreq);
+    const sysfs = parseSysfsNumber(actFreq) || parseSysfsNumber(curFreq);
+    const frequency = sample?.frequency?.actual ?? sysfs;
     if(frequency == null || isNaN(frequency)) return undefined;
     return Math.round(frequency);
 }
