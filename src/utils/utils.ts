@@ -2162,8 +2162,11 @@ export default class Utils {
 
     static listDirAsync(
         path: string,
-        options: { folders: boolean; files: boolean } = { folders: true, files: true }
-    ): Promise<{ name: string; isFolder: boolean }[]> {
+        options: { folders: boolean; files: boolean; symlinks?: boolean } = {
+            folders: true,
+            files: true,
+        }
+    ): Promise<{ name: string; isFolder: boolean; target?: string }[]> {
         return new Promise((resolve, reject) => {
             // Check if the path is valid and not empty
             if(!path || typeof path !== 'string') {
@@ -2179,9 +2182,14 @@ export default class Utils {
                 return;
             }
 
+            // With symlinks, the targets are read as written rather than followed and stat()ed
             dir.enumerate_children_async(
-                'standard::name,standard::type',
-                Gio.FileQueryInfoFlags.NONE,
+                options.symlinks
+                    ? 'standard::name,standard::type,standard::symlink-target'
+                    : 'standard::name,standard::type',
+                options.symlinks
+                    ? Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS
+                    : Gio.FileQueryInfoFlags.NONE,
                 0,
                 null,
                 (sourceObject, result) => {
@@ -2204,7 +2212,11 @@ export default class Utils {
                             if(options.files === false && !isFolder) continue;
 
                             const name = fileInfo.get_name();
-                            files.push({ name, isFolder });
+                            // get_symlink_target() is a critical on entries without the attribute
+                            const target = fileInfo.has_attribute('standard::symlink-target')
+                                ? (fileInfo.get_symlink_target() ?? undefined)
+                                : undefined;
+                            files.push({ name, isFolder, target });
                         }
                         resolve(files);
                     } catch(e: any) {
